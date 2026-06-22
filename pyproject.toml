@@ -16,6 +16,7 @@ classifiers = [
 dynamic = ["version"]
 dependencies = [
     "mopidy >= 4.0.0",
+    "pydantic >= 2.12",
     "pykka >= 4.1",
     "requests >= 2.32",
 ]
@@ -96,6 +97,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"src/mopidy_spotify/commands.py" = [
+    "T201",    # print
+]
 "tests/*" = [
     "ANN201",  # missing-return-type-undocumented-public-function
     "ANN202",  # missing-return-type-private-function
