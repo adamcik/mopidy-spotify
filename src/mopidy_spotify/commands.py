@@ -1,11 +1,12 @@
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import cyclopts
 from mopidy.config import Config
 
-from mopidy_spotify import Extension
+from mopidy_spotify import Extension, auth_flow, tokens
 
 logger = logging.getLogger(__name__)
 
@@ -13,10 +14,50 @@ logger = logging.getLogger(__name__)
 app = cyclopts.App(help="Spotify extension commands.")
 
 
+def run_auth_command(
+    flow: auth_flow.AuthFlow,
+    *,
+    read_input: Callable[[], str] = input,
+    write_output: Callable[..., None] = print,
+) -> int:
+    challenge = flow.start_auth()
+
+    write_output(
+        "Please visit the following URL and paste the full redirect URL into "
+        "this terminal:\n"
+    )
+    write_output(challenge.authorization_url)
+    write_output()
+
+    try:
+        pasted_result = read_input()
+    except EOFError:
+        write_output("Authentication aborted.")
+        return 1
+
+    try:
+        flow.finish_auth(challenge, pasted_result)
+    except auth_flow.AuthFlowError as exc:
+        write_output(str(exc))
+        return 1
+
+    write_output("Refresh token successfully stored.")
+    return 0
+
+
+@app.command(help="Authenticate with Spotify using PKCE.")
+def auth() -> int:
+    config = Config.get_global()
+    auth_state_path = Extension.get_auth_state_path(config)
+    flow = auth_flow.AuthFlow(config, auth_state_path)
+    return run_auth_command(flow)
+
+
 @app.command(help="Logout from Spotify account.")
 def logout() -> None:
     config = Config.get_global()
     credentials_dir = Extension().get_credentials_dir(config)
+    auth_state_path = Extension.get_auth_state_path(config)
     try:
         for root, dirs, files in os.walk(credentials_dir, topdown=False):
             root_path = Path(root)
@@ -29,6 +70,10 @@ def logout() -> None:
                 dir_path.rmdir()
                 logger.debug(f"Removed directory {dir_path}")
         credentials_dir.rmdir()
+        tokens.FileAuthStateStore(auth_state_path).save(
+            tokens.BridgeClearedAuthPayload()
+        )
+        logger.debug(f"Cleared file {auth_state_path}")
     except Exception as error:  # noqa: BLE001
         logger.warning(f"Failed to logout from Spotify: {error}")
     else:

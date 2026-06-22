@@ -17,10 +17,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import requests
 
-from mopidy_spotify import utils
+from mopidy_spotify import tokens, utils
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
+    from pathlib import Path
 
     from mopidy.config import ProxyConfig
     from mopidy.types import Uri
@@ -38,6 +39,10 @@ class OAuthTokenRefreshError(Exception):
         super().__init__(message)
 
 
+class OAuthPermanentRefreshError(OAuthTokenRefreshError):
+    pass
+
+
 class OAuthClientError(Exception):
     pass
 
@@ -47,15 +52,18 @@ class OAuthClient:
         self,
         *,
         base_url: str,
-        refresh_url: str,
+        bridge_refresh_url: str,
         client_id: str | None = None,
         client_secret: str | None = None,
+        auth_state_path: Path | None = None,
         proxy_config: ProxyConfig | None = None,
         expiry_margin: int = 60,
         timeout: int = 10,
         retries: int = 3,
         retry_statuses: tuple[int, ...] = (500, 502, 503, 429),
     ) -> None:
+        self._client_id = client_id
+        self._auth_state_path = auth_state_path
         if client_id and client_secret:
             self._auth = (client_id, client_secret)
         else:
@@ -63,7 +71,7 @@ class OAuthClient:
         self._access_token = None
 
         self._base_url = base_url
-        self._refresh_url = refresh_url
+        self._bridge_refresh_url = bridge_refresh_url
 
         self._margin = expiry_margin
         self._expires = 0
@@ -151,18 +159,84 @@ class OAuthClient:
         if not self._refresh_mutex.locked():
             msg = "Lock must be held before calling."
             raise OAuthTokenRefreshError(msg)
-        return not self._auth or time.time() > self._expires - self._margin
+        return (
+            "Authorization" not in self._headers and self._expires == 0
+        ) or time.time() > self._expires - self._margin
+
+    def _load_auth_payload(self) -> tokens.AuthPayload | None:
+        if self._auth_state_path is None or not self._auth_state_path.exists():
+            return None
+
+        try:
+            return tokens.FileAuthStateStore(self._auth_state_path).load()
+        except tokens.InvalidRefreshTokenError as exc:
+            msg = f"{exc}. Run `mopidy spotify auth` to create a new one."
+            raise OAuthTokenRefreshError(msg) from exc
+
+    def _pkce_refresh_request(self) -> requests.Request:
+        if self._auth_state_path is None:
+            msg = "missing auth_state_path"
+            raise OAuthTokenRefreshError(msg)
+        try:
+            return tokens.refresh_token_request(self._auth_state_path)
+        except tokens.InvalidRefreshTokenError as exc:
+            msg = f"{exc}. Run `mopidy spotify auth` to create a new one."
+            raise OAuthPermanentRefreshError(msg) from exc
+
+    def _bridge_refresh_request(self) -> requests.Request:
+        return requests.Request(
+            "POST",
+            self._bridge_refresh_url,
+            auth=self._auth,
+            data={"grant_type": "client_credentials"},
+        )
+
+    def _token_refresh_request(self) -> requests.Request:
+        payload = self._load_auth_payload()
+        if payload is None:
+            return self._bridge_refresh_request()
+
+        match payload.mode:
+            case "pkce":
+                return self._pkce_refresh_request()
+            case "bridge":
+                return self._bridge_refresh_request()
+            case _:
+                msg = f"unsupported auth mode: {payload.mode}"
+                raise OAuthTokenRefreshError(msg)
+
+    def _should_store_refresh_token(self) -> bool:
+        payload = self._load_auth_payload()
+        return payload is not None and payload.mode == "pkce"
+
+    def _handle_invalid_grant(
+        self,
+        error_code: str = "invalid_grant",
+        error_description: str | None = None,
+    ) -> None:
+        _ = error_code, error_description
+        if self._auth_state_path:
+            tokens.FileAuthStateStore(self._auth_state_path).save(
+                tokens.PkceRevokedAuthPayload()
+            )
+        error = (
+            "Spotify refresh token is no longer valid. "
+            "Run `mopidy spotify auth` to re-authorize."
+        )
+        raise OAuthPermanentRefreshError(error)
 
     def _refresh_token(self) -> None:
-        logger.debug(f"Fetching OAuth token from {self._refresh_url}")
-
         if not self._refresh_mutex.locked():
             msg = "Lock must be held before calling."
             raise OAuthTokenRefreshError(msg)
 
-        data = {"grant_type": "client_credentials"}
+        request = self._token_refresh_request()
+        logger.debug(f"Fetching OAuth token from {request.url}")
         result = self._request_with_retries(
-            "POST", self._refresh_url, auth=self._auth, data=data
+            request.method,
+            request.url,
+            auth=request.auth,
+            data=request.data,
         )
 
         if result is None:
@@ -181,6 +255,16 @@ class OAuthClient:
         self._access_token = result["access_token"]
         self._headers["Authorization"] = f"Bearer {self._access_token}"
         self._expires = time.time() + result.get("expires_in", float("Inf"))
+        if (
+            self._auth_state_path
+            and result.get("refresh_token")
+            and self._should_store_refresh_token()
+        ):
+            tokens.FileAuthStateStore(self._auth_state_path).save(
+                tokens.PkceAuthorizedAuthPayload(
+                    refresh_token=result["refresh_token"],
+                )
+            )
 
         if result.get("expires_in"):
             logger.debug(
@@ -545,19 +629,104 @@ class SpotifyOAuthClient(OAuthClient):
         self,
         *,
         client_id: str,
-        client_secret: str,
+        client_secret: str | None,
+        auth_state_path: Path | None = None,
         proxy_config: ProxyConfig | None = None,
     ) -> None:
         super().__init__(
             base_url="https://api.spotify.com/v1",
-            refresh_url="https://auth.mopidy.com/spotify/token",
+            bridge_refresh_url="https://auth.mopidy.com/spotify/token",
             client_id=client_id,
             client_secret=client_secret,
+            auth_state_path=auth_state_path,
             proxy_config=proxy_config,
         )
+        self._refresh_url = refresh_url
         self.user_id: str | None = None
         self._cache: dict[str, WebResponse] = {}
         self._extra_expiry = self.DEFAULT_EXTRA_EXPIRY
+        self._active_auth_mode: str = "bridge"
+
+    def _refresh_auth_config(
+        self,
+        auth_state_path: Path | None,
+        client_secret: str | None,
+    ) -> tuple[str, str | None]:
+        if auth_state_path:
+            try:
+                payload = tokens.FileAuthStateStore(auth_state_path).load()
+            except tokens.InvalidRefreshTokenError:
+                if auth_state_path.exists():
+                    return self.SPOTIFY_REFRESH_URL, None
+            else:
+                if payload and payload.mode == "pkce":
+                    return self.SPOTIFY_REFRESH_URL, None
+        return self.AUTH_PROXY_REFRESH_URL, client_secret
+
+    def _token_refresh_request(self) -> requests.Request:
+        self._bridge_refresh_url, client_secret = self._refresh_auth_config(
+            self._auth_state_path,
+            self._client_secret,
+        )
+        if self._client_id and client_secret:
+            self._auth = (self._client_id, client_secret)
+        else:
+            self._auth = None
+
+        if not self._auth_state_path:
+            self._active_auth_mode = "bridge"
+            return super()._token_refresh_request()
+
+        try:
+            payload = tokens.FileAuthStateStore(self._auth_state_path).load()
+        except tokens.InvalidRefreshTokenError as exc:
+            if self._auth_state_path.exists():
+                msg = f"{exc}. Run `mopidy spotify auth` to create a new one."
+                raise OAuthPermanentRefreshError(msg) from exc
+            self._active_auth_mode = "bridge"
+            return super()._token_refresh_request()
+
+        if payload is None:
+            self._active_auth_mode = "bridge"
+            return super()._token_refresh_request()
+        if payload.mode == "pkce":
+            self._active_auth_mode = "pkce"
+            return super()._token_refresh_request()
+        if payload.state == "permanent_error":
+            detail = payload.error_description or payload.error_code
+            raise OAuthPermanentRefreshError(detail)
+
+        self._active_auth_mode = "bridge"
+        return requests.Request(
+            "POST",
+            self._bridge_refresh_url,
+            auth=self._auth,
+            data={"grant_type": "client_credentials"},
+        )
+
+    def _refresh_token(self) -> None:
+        super()._refresh_token()
+        if self._active_auth_mode == "bridge" and self._auth_state_path:
+            tokens.FileAuthStateStore(self._auth_state_path).save(
+                tokens.BridgeConfiguredAuthPayload()
+            )
+
+    def _handle_invalid_grant(
+        self,
+        error_code: str = "invalid_grant",
+        error_description: str | None = None,
+    ) -> None:
+        if self._auth_state_path and self._active_auth_mode == "bridge":
+            tokens.FileAuthStateStore(self._auth_state_path).save(
+                tokens.BridgePermanentErrorAuthPayload(
+                    error_code=error_code,
+                    error_description=error_description,
+                )
+            )
+            detail = error_description or error_code
+            raise OAuthPermanentRefreshError(detail)
+
+        super()._handle_invalid_grant(error_code, error_description)
 
     def get_one(self, path: str, *args: Any, **kwargs: Any) -> WebResponse:
         _trace(f"Fetching page {path!r}")
