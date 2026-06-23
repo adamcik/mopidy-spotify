@@ -1,0 +1,162 @@
+import json
+from pathlib import Path
+
+import pytest
+from mopidy.config import Config
+
+from mopidy_spotify.auth_flow import (
+    AuthChallenge,
+    AuthExchangeError,
+    AuthFlow,
+    AuthInvalidStateError,
+    AuthMissingCodeError,
+    AuthSuccess,
+    TokenExchangeResponse,
+)
+
+
+def exchange_response(**payload: object):
+    return TokenExchangeResponse.model_validate(payload)
+
+
+def raise_invalid_authorization_response(result: str):
+    _ = result
+    message = "invalid authorization response."
+    raise ValueError(message)
+
+
+def test_start_auth_returns_typed_challenge():
+    flow = AuthFlow(
+        Config({"proxy": {}}),
+        Path("auth.json"),
+        generate_pkce_verifier=lambda: ("verifier-123", "challenge-123"),
+        generate_state=lambda: "state-123",
+        generate_authorization_url=lambda challenge, state: (
+            f"https://example.com/{challenge}/{state}"
+        ),
+    )
+    challenge = flow.start_auth()
+
+    assert challenge == AuthChallenge(
+        authorization_url="https://example.com/challenge-123/state-123",
+        state="state-123",
+        verifier="verifier-123",
+    )
+
+
+def test_finish_auth_persists_refresh_token_on_success(tmp_path: Path):
+    auth_state_path = tmp_path / "auth.json"
+    token_value = "token-123"  # noqa: S105
+    challenge = AuthChallenge("https://example.com", "state-123", "verifier-123")
+    flow = AuthFlow(
+        Config({"proxy": {}}),
+        auth_state_path,
+        parse_authorization_result=lambda result: {
+            "state": "state-123",
+            "code": "code-123",
+        },
+        exchange_authorization_code=lambda config, code, verifier: exchange_response(
+            refresh_token=token_value
+        ),
+    )
+
+    result = flow.finish_auth(
+        challenge,
+        "ignored",
+    )
+
+    assert result == AuthSuccess(token_value)
+    assert json.loads(auth_state_path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "mode": "pkce",
+        "state": "authorized",
+        "refresh_token": token_value,
+    }
+
+
+def test_finish_auth_rejects_invalid_state(tmp_path: Path):
+    flow = AuthFlow(
+        Config({"proxy": {}}),
+        tmp_path / "auth.json",
+        parse_authorization_result=lambda result: {
+            "state": "wrong-state",
+            "code": "code-123",
+        },
+    )
+
+    with pytest.raises(AuthInvalidStateError):
+        flow.finish_auth(
+            AuthChallenge("https://example.com", "state-123", "verifier-123"),
+            "ignored",
+        )
+
+
+def test_finish_auth_rejects_missing_code(tmp_path: Path):
+    flow = AuthFlow(
+        Config({"proxy": {}}),
+        tmp_path / "auth.json",
+        parse_authorization_result=lambda result: {"state": "state-123"},
+    )
+
+    with pytest.raises(AuthMissingCodeError):
+        flow.finish_auth(
+            AuthChallenge("https://example.com", "state-123", "verifier-123"),
+            "ignored",
+        )
+
+
+def test_finish_auth_reports_exchange_failure(tmp_path: Path):
+    flow = AuthFlow(
+        Config({"proxy": {}}),
+        tmp_path / "auth.json",
+        parse_authorization_result=lambda result: {
+            "state": "state-123",
+            "code": "code-123",
+        },
+        exchange_authorization_code=lambda config, code, verifier: (
+            _ for _ in ()
+        ).throw(ValueError("network down")),
+    )
+
+    with pytest.raises(AuthExchangeError, match="Something went wrong: network down"):
+        flow.finish_auth(
+            AuthChallenge("https://example.com", "state-123", "verifier-123"),
+            "ignored",
+        )
+
+
+def test_finish_auth_reports_provider_error(tmp_path: Path):
+    flow = AuthFlow(
+        Config({"proxy": {}}),
+        tmp_path / "auth.json",
+        parse_authorization_result=lambda result: {
+            "state": "state-123",
+            "code": "code-123",
+        },
+        exchange_authorization_code=lambda config, code, verifier: exchange_response(
+            error="access_denied"
+        ),
+    )
+
+    with pytest.raises(AuthExchangeError, match="Something went wrong: access_denied"):
+        flow.finish_auth(
+            AuthChallenge("https://example.com", "state-123", "verifier-123"),
+            "ignored",
+        )
+
+
+def test_finish_auth_reports_malformed_authorization_result(tmp_path: Path):
+    flow = AuthFlow(
+        Config({"proxy": {}}),
+        tmp_path / "auth.json",
+        parse_authorization_result=raise_invalid_authorization_response,
+    )
+
+    with pytest.raises(
+        AuthExchangeError,
+        match=r"Something went wrong: invalid authorization response\.",
+    ):
+        flow.finish_auth(
+            AuthChallenge("https://example.com", "state-123", "verifier-123"),
+            "ignored",
+        )

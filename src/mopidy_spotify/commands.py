@@ -6,7 +6,7 @@ from pathlib import Path
 import cyclopts
 from mopidy.config import Config
 
-from mopidy_spotify import Extension, auth_flow, tokens
+from mopidy_spotify import Extension, auth_flow, auth_state
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,11 @@ def logout() -> None:
     credentials_dir = Extension().get_credentials_dir(config)
     auth_state_path = Extension.get_auth_state_path(config)
     try:
+        try:
+            payload = auth_state.FileAuthStateStore(auth_state_path).load()
+        except auth_state.InvalidRefreshTokenError:
+            payload = None
+        mode = payload.mode if payload is not None else "bridge"
         for root, dirs, files in os.walk(credentials_dir, topdown=False):
             root_path = Path(root)
             for name in files:
@@ -70,8 +75,8 @@ def logout() -> None:
                 dir_path.rmdir()
                 logger.debug(f"Removed directory {dir_path}")
         credentials_dir.rmdir()
-        tokens.FileAuthStateStore(auth_state_path).save(
-            tokens.BridgeClearedAuthPayload()
+        auth_state.FileAuthStateStore(auth_state_path).save(
+            auth_state.ClearedAuthPayload(mode=mode)
         )
         logger.debug(f"Cleared file {auth_state_path}")
     except Exception as error:  # noqa: BLE001

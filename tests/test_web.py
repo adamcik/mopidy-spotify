@@ -12,7 +12,7 @@ from mopidy.types import Uri
 from responses import matchers
 
 import mopidy_spotify
-from mopidy_spotify import tokens, web
+from mopidy_spotify import pkce, web
 
 
 @pytest.fixture
@@ -159,7 +159,7 @@ def test_spotify_oauth_client_uses_pkce_refresh_request_when_present(
     assert request.url == "https://accounts.spotify.com/api/token"
     assert request.auth is None
     assert request.data == {
-        "client_id": tokens.CLIENT_ID,
+        "client_id": pkce.CLIENT_ID,
         "grant_type": "refresh_token",
         "refresh_token": "refresh-token-123",
     }
@@ -171,6 +171,31 @@ def test_spotify_oauth_client_uses_auth_proxy_with_bridge_auth_state(
     refresh_token_path = tmp_path / "auth.json"
     refresh_token_path.write_text(
         json.dumps({"version": 1, "mode": "bridge", "state": "configured"}),
+        encoding="utf-8",
+    )
+
+    client = web.SpotifyOAuthClient(
+        client_id=config["spotify"]["client_id"],
+        client_secret=config["spotify"]["client_secret"],
+        auth_state_path=refresh_token_path,
+        proxy_config=None,
+    )
+    request = client._token_refresh_request()
+
+    assert request.url == "https://auth.mopidy.com/spotify/token"
+    assert request.auth == (
+        config["spotify"]["client_id"],
+        config["spotify"]["client_secret"],
+    )
+    assert request.data == {"grant_type": "client_credentials"}
+
+
+def test_spotify_oauth_client_uses_auth_proxy_with_cleared_pkce_state(
+    config: dict[str, Any], tmp_path: Path
+):
+    refresh_token_path = tmp_path / "auth.json"
+    refresh_token_path.write_text(
+        json.dumps({"version": 1, "mode": "pkce", "state": "cleared"}),
         encoding="utf-8",
     )
 
@@ -432,7 +457,7 @@ def test_get_uses_stored_refresh_token(
         match=[
             matchers.urlencoded_params_matcher(
                 {
-                    "client_id": tokens.CLIENT_ID,
+                    "client_id": pkce.CLIENT_ID,
                     "grant_type": "refresh_token",
                     "refresh_token": "refresh-token-1",
                 }
@@ -488,7 +513,9 @@ def test_get_clears_expired_refresh_token_and_fails_fast(
     assert json.loads(refresh_token_path.read_text()) == {
         "version": 1,
         "mode": "pkce",
-        "state": "revoked",
+        "state": "permanent_error",
+        "error_code": "invalid_grant",
+        "error_description": "Refresh token expired",
     }
     assert "Run `mopidy spotify auth`" in caplog.text
 
@@ -543,14 +570,22 @@ def test_get_keeps_refresh_token_on_transient_refresh_failure(
     assert refresh_token_path.exists()
 
 
-def test_get_fails_fast_when_auth_json_is_revoked(
+def test_get_fails_fast_when_auth_json_is_permanent_error(
     config: dict[str, Any],
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ):
     refresh_token_path = tmp_path / "auth.json"
     refresh_token_path.write_text(
-        json.dumps({"version": 1, "mode": "pkce", "state": "revoked"}),
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "pkce",
+                "state": "permanent_error",
+                "error_code": "invalid_grant",
+                "error_description": "Refresh token expired",
+            }
+        ),
         encoding="utf-8",
     )
     client = web.OAuthClient(
@@ -567,7 +602,7 @@ def test_get_fails_fast_when_auth_json_is_revoked(
     assert result == {}
     assert len(responses.calls) == 0
     assert "OAuth token refresh failed" in caplog.text
-    assert "revoked" in caplog.text
+    assert "Refresh token expired" in caplog.text
 
 
 @responses.activate
@@ -613,7 +648,7 @@ def test_get_recovers_after_reauthorizing_with_new_auth_json(
         match=[
             matchers.urlencoded_params_matcher(
                 {
-                    "client_id": tokens.CLIENT_ID,
+                    "client_id": pkce.CLIENT_ID,
                     "grant_type": "refresh_token",
                     "refresh_token": "refresh-token-2",
                 }
@@ -644,6 +679,7 @@ def test_get_recovers_after_reauthorizing_with_new_auth_json(
     [
         "{",
         json.dumps({"version": 2, "refresh_token": "refresh-token-1"}),
+        json.dumps({"version": 1, "refresh_token": "refresh-token-1"}),
         json.dumps({"version": 1}),
         json.dumps({"version": 1, "refresh_token": "refresh-token-1", "extra": 1}),
     ],
@@ -710,7 +746,7 @@ def test_get_uses_stored_refresh_token_without_legacy_client_id(
         match=[
             matchers.urlencoded_params_matcher(
                 {
-                    "client_id": tokens.CLIENT_ID,
+                    "client_id": pkce.CLIENT_ID,
                     "grant_type": "refresh_token",
                     "refresh_token": "refresh-token-1",
                 }

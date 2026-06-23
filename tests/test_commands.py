@@ -69,6 +69,26 @@ def test_logout_command(tmp_path: Path):
         assert not credentials_dir.is_dir()
         assert json.loads(auth_state_path.read_text(encoding="utf-8")) == {
             "version": 1,
+            "mode": "pkce",
+            "state": "cleared",
+        }
+
+
+def test_logout_command_handles_corrupt_auth_state(tmp_path: Path):
+    config = Config({"core": {"data_dir": tmp_path}})
+    with mock.patch.object(Config, "get_global", return_value=config):
+        credentials_dir = Extension().get_credentials_dir(config)
+        auth_state_path = Extension.get_auth_state_path(config)
+        (credentials_dir / "foo").mkdir()
+        (credentials_dir / "bar").touch()
+        auth_state_path.parent.mkdir(parents=True, exist_ok=True)
+        auth_state_path.write_text("not-json", encoding="utf-8")
+
+        logout()
+
+        assert not credentials_dir.is_dir()
+        assert json.loads(auth_state_path.read_text(encoding="utf-8")) == {
+            "version": 1,
             "mode": "bridge",
             "state": "cleared",
         }
