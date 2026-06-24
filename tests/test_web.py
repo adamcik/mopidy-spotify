@@ -215,6 +215,42 @@ def test_spotify_oauth_client_uses_auth_proxy_with_cleared_pkce_state(
     assert request.data == {"grant_type": "client_credentials"}
 
 
+@responses.activate
+def test_spotify_oauth_client_canonicalizes_cleared_pkce_state_after_bridge_refresh(
+    config: dict[str, Any], tmp_path: Path
+):
+    refresh_token_path = tmp_path / "auth.json"
+    refresh_token_path.write_text(
+        json.dumps({"version": 1, "mode": "pkce", "state": "cleared"}),
+        encoding="utf-8",
+    )
+
+    client = web.SpotifyOAuthClient(
+        client_id=config["spotify"]["client_id"],
+        client_secret=config["spotify"]["client_secret"],
+        auth_state_path=refresh_token_path,
+        proxy_config=None,
+    )
+    responses.add(
+        responses.POST,
+        "https://auth.mopidy.com/spotify/token",
+        json={
+            "access_token": "access-token-2",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        },
+    )
+
+    with client._refresh_mutex:
+        client._refresh_token()
+
+    assert json.loads(refresh_token_path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "mode": "bridge",
+        "state": "configured",
+    }
+
+
 def test_spotify_oauth_client_uses_auth_proxy_with_persisted_bridge_state(
     config: dict[str, Any], tmp_path: Path
 ):
