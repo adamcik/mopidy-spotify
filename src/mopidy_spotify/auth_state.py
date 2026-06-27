@@ -81,15 +81,15 @@ class FileAuthStateStore:
             file_handle.write(content)
 
 
-def refresh_token_request(auth_state_path: Path) -> requests.Request:
-    payload = FileAuthStateStore(auth_state_path).load()
+def refresh_token_request(store: FileAuthStateStore) -> requests.Request:
+    payload = store.load()
     if payload is None:
         msg = "missing refresh_token"
         raise ValueError(msg)
     if payload.state != "authorized" or payload.mode != "pkce":
         error = (
             "Spotify auth.json uses unsupported state for refresh_token: "
-            f"{auth_state_path} ({payload.mode}/{payload.state})"
+            f"{store.path} ({payload.mode}/{payload.state})"
         )
         raise InvalidRefreshTokenError(error)
     return requests.Request(

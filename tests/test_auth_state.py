@@ -41,4 +41,4 @@ def test_refresh_token_request_requires_pkce_authorized(tmp_path: Path):
     )
 
     with pytest.raises(auth_state.InvalidRefreshTokenError):
-        auth_state.refresh_token_request(auth_state_path)
+        auth_state.refresh_token_request(auth_state.FileAuthStateStore(auth_state_path))

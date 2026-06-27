@@ -18,10 +18,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import requests
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
-from mopidy_spotify import utils
+from mopidy_spotify import auth_state, refresh_providers, utils
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Callable, Iterator, Mapping
+    from pathlib import Path
 
     from mopidy.config import ProxyConfig
     from mopidy.types import Uri
@@ -98,6 +99,7 @@ class OAuthClient:
         refresh_url: str,
         client_id: str | None = None,
         client_secret: str | None = None,
+        build_refresh_request: Callable[[], requests.Request] | None = None,
         proxy_config: ProxyConfig | None = None,
         expiry_margin: int = 60,
         timeout: int = 10,
@@ -112,10 +114,13 @@ class OAuthClient:
 
         self._base_url = base_url
         self._refresh_url = refresh_url
+        if build_refresh_request is None:
+            self._build_refresh_request = self._static_refresh_request
+        else:
+            self._build_refresh_request = build_refresh_request
 
         self._margin = expiry_margin
         self._expires = 0
-        self._authorization_failed = False
 
         self._timeout = timeout
         self._number_of_retries = retries
@@ -146,10 +151,6 @@ class OAuthClient:
         *args: Any,
         **kwargs: Any,
     ) -> WebResponse:
-        if self._authorization_failed:
-            logger.debug("Blocking request as previous authorization failed.")
-            return WebResponse(None, None)
-
         params = kwargs.pop("params", None)
         path = self._normalise_query_string(path, params)
 
@@ -199,43 +200,96 @@ class OAuthClient:
         if not self._refresh_mutex.locked():
             msg = "Lock must be held before calling."
             raise OAuthTokenRefreshError(msg)
-        return not self._auth or time.time() > self._expires - self._margin
+        return (
+            "Authorization" not in self._headers and self._expires == 0
+        ) or time.time() > self._expires - self._margin
 
-    def _refresh_token(self) -> None:
-        logger.debug(f"Fetching OAuth token from {self._refresh_url}")
+    def _static_refresh_request(self) -> requests.Request:
+        return requests.Request(
+            "POST",
+            self._refresh_url,
+            auth=self._auth,
+            data={"grant_type": "client_credentials"},
+        )
 
-        if not self._refresh_mutex.locked():
-            msg = "Lock must be held before calling."
-            raise OAuthTokenRefreshError(msg)
+    def _token_refresh_request(self) -> requests.Request:
+        return self._build_refresh_request()
 
-        data = {"grant_type": "client_credentials"}
+    def _is_permanent_error(self, error_code: str, *, context: Any = None) -> bool:
+        _ = context
+        return error_code == "invalid_grant"
+
+    def _handle_permanent_error(
+        self,
+        error_code: str = "invalid_grant",
+        error_description: str | None = None,
+        *,
+        context: Any = None,
+    ) -> None:
+        _ = context
+        error = error_description or error_code
+        raise OAuthPermanentRefreshError(error)
+
+    def _handle_token_refresh_success(
+        self,
+        response: OAuthTokenResponse,
+        *,
+        context: Any = None,
+    ) -> None:
+        _ = response, context
+
+    def _execute_token_refresh(
+        self,
+        request: requests.Request,
+        *,
+        context: Any = None,
+    ) -> OAuthTokenResponse:
+        logger.debug(f"Fetching OAuth token from {request.url}")
         result = self._request_with_retries(
-            "POST", self._refresh_url, auth=self._auth, data=data
+            request.method,
+            request.url,
+            auth=request.auth,
+            data=request.data,
         )
 
         if result is None:
             msg = "Unknown error."
             raise OAuthTokenRefreshError(msg)
-        if result.get("error"):
-            msg = f"{result['error']} {result.get('error_description', '')}"
-            raise OAuthTokenRefreshError(msg)
-        if not result.get("access_token"):
-            msg = "missing access_token"
-            raise OAuthTokenRefreshError(msg)
-        if result.get("token_type") != "Bearer":
-            msg = f"wrong token_type: {result.get('token_type')}"
+
+        response = _parse_token_refresh_response(result)
+        if isinstance(response, OAuthErrorResponse):
+            if self._is_permanent_error(response.error, context=context):
+                self._handle_permanent_error(
+                    response.error,
+                    response.error_description,
+                    context=context,
+                )
+            msg = f"{response.error} {response.error_description or ''}"
             raise OAuthTokenRefreshError(msg)
 
-        self._access_token = result["access_token"]
+        if response.token_type != "Bearer":  # noqa: S105
+            msg = f"wrong token_type: {response.token_type}"
+            raise OAuthTokenRefreshError(msg)
+
+        self._access_token = response.access_token
         self._headers["Authorization"] = f"Bearer {self._access_token}"
-        self._expires = time.time() + result.get("expires_in", float("Inf"))
+        self._expires = time.time() + (response.expires_in or float("Inf"))
+        self._handle_token_refresh_success(response, context=context)
 
-        if result.get("expires_in"):
-            logger.debug(
-                f"Token expires in {result['expires_in']} seconds.",
-            )
-        if result.get("scope"):
-            logger.debug(f"Token scopes: {result['scope']}")
+        if response.expires_in:
+            logger.debug(f"Token expires in {response.expires_in} seconds.")
+        if response.scope:
+            logger.debug(f"Token scopes: {response.scope}")
+
+        return response
+
+    def _refresh_token(self) -> None:
+        if not self._refresh_mutex.locked():
+            msg = "Lock must be held before calling."
+            raise OAuthTokenRefreshError(msg)
+
+        request = self._token_refresh_request()
+        self._execute_token_refresh(request)
 
     def _request_with_retries(
         self,
@@ -296,7 +350,6 @@ class OAuthClient:
             )
 
         if status_code == HTTPStatus.UNAUTHORIZED:
-            self._authorization_failed = True
             logger.error(
                 "Authorization failed, not attempting Spotify API "
                 "request. Please get new credentials from "
@@ -592,20 +645,181 @@ class SpotifyOAuthClient(OAuthClient):
     def __init__(
         self,
         *,
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
+        auth_state_path: Path | None = None,
         proxy_config: ProxyConfig | None = None,
     ) -> None:
+        self._bridge_client_id = client_id
+        self._bridge_client_secret = client_secret
+        if auth_state_path is None:
+            self._auth_state_store = None
+        else:
+            self._auth_state_store = auth_state.FileAuthStateStore(auth_state_path)
+        self._refresh_providers: tuple[
+            refresh_providers.RefreshProvider,
+            ...,
+        ] = (
+            refresh_providers.PkceRefreshProvider(),
+            refresh_providers.BridgeRefreshProvider(
+                client_id=client_id,
+                client_secret=client_secret,
+            ),
+        )
         super().__init__(
             base_url="https://api.spotify.com/v1",
-            refresh_url="https://auth.mopidy.com/spotify/token",
+            refresh_url=BRIDGE_REFRESH_URL,
             client_id=client_id,
             client_secret=client_secret,
+            build_refresh_request=self._token_refresh_request,
             proxy_config=proxy_config,
         )
         self.user_id: str | None = None
         self._cache: dict[str, WebResponse] = {}
         self._extra_expiry = self.DEFAULT_EXTRA_EXPIRY
+
+    def _load_auth_payload(self) -> auth_state.AuthPayload | None:
+        if self._auth_state_store is None:
+            return None
+
+        try:
+            return self._auth_state_store.load()
+        except auth_state.InvalidRefreshTokenError as exc:
+            if self._auth_state_store.path.exists():
+                msg = (
+                    f"{exc}. Run `mopidy spotify auth` or configure client_id/"
+                    "client_secret in the Spotify extension config."
+                )
+                raise OAuthPermanentRefreshError(msg) from exc
+            return None
+
+    @staticmethod
+    def _uses_pkce(payload: auth_state.AuthPayload | None) -> bool:
+        return (
+            payload is not None
+            and payload.mode == "pkce"
+            and payload.state == "authorized"
+        )
+
+    def _token_refresh_request_for_payload(
+        self,
+        payload: auth_state.AuthPayload | None,
+    ) -> tuple[requests.Request, refresh_providers.RefreshProvider]:
+        if payload is not None and payload.state == "permanent_error":
+            detail = payload.error_description or payload.error_code
+            raise OAuthPermanentRefreshError(detail)
+
+        for provider in self._refresh_providers:
+            request = provider.prepare(payload)
+            if request is not None:
+                return request, provider
+
+        msg = "No refresh provider available."
+        raise OAuthTokenRefreshError(msg)
+
+    def _token_refresh_request(self) -> requests.Request:
+        payload = self._load_auth_payload()
+        request, _ = self._token_refresh_request_for_payload(payload)
+        return request
+
+    def _save_auth_payload(self, payload: auth_state.AuthPayload) -> None:
+        if self._auth_state_store is None:
+            msg = "missing auth_state_store"
+            raise OAuthTokenRefreshError(msg)
+        self._auth_state_store.save(payload)
+
+    def _refresh_token(self) -> None:
+        if not self._refresh_mutex.locked():
+            msg = "Lock must be held before calling."
+            raise OAuthTokenRefreshError(msg)
+
+        payload = self._load_auth_payload()
+        request, provider = self._token_refresh_request_for_payload(payload)
+        logger.debug(f"Fetching OAuth token from {request.url}")
+        result = self._request_with_retries(
+            request.method,
+            request.url,
+            auth=request.auth,
+            data=request.data,
+        )
+
+        if result is None:
+            msg = "Unknown error."
+            raise OAuthTokenRefreshError(msg)
+
+        response = _parse_token_refresh_response(result)
+
+        if isinstance(response, OAuthErrorResponse):
+            next_payload = provider.on_error(response, payload, result._status_code)
+            self._save_auth_payload(next_payload)
+            detail = (
+                "Spotify refresh token is no longer valid. "
+                "Run `mopidy spotify auth` or configure client_id/"
+                "client_secret in the Spotify extension config."
+            )
+            raise OAuthPermanentRefreshError(detail or response.error)
+
+        next_payload = provider.on_success(response, payload)
+
+        self._access_token = response.access_token
+        self._headers["Authorization"] = f"Bearer {self._access_token}"
+        self._expires = time.time() + (response.expires_in or float("Inf"))
+
+        if response.expires_in:
+            logger.debug(f"Token expires in {response.expires_in} seconds.")
+        if response.scope:
+            logger.debug(f"Token scopes: {response.scope}")
+
+        self._save_auth_payload(next_payload)
+
+    def _is_permanent_error(
+        self,
+        error_code: str,
+        *,
+        context: auth_state.AuthPayload | None = None,
+    ) -> bool:
+        _ = context
+        return error_code == "invalid_grant"
+
+    def _handle_permanent_error(
+        self,
+        error_code: str = "invalid_grant",
+        error_description: str | None = None,
+        *,
+        context: auth_state.AuthPayload | None = None,
+    ) -> None:
+        if self._auth_state_store is None:
+            super()._handle_permanent_error(
+                error_code,
+                error_description,
+                context=context,
+            )
+            return
+
+        if not self._uses_pkce(context):
+            self._auth_state_store.save(
+                auth_state.PermanentErrorAuthPayload(
+                    mode="bridge",
+                    error_code=error_code,
+                    error_description=error_description,
+                )
+            )
+            detail = error_description or error_code
+            raise OAuthPermanentRefreshError(detail)
+
+        self._auth_state_store.save(
+            auth_state.PermanentErrorAuthPayload(
+                mode="pkce",
+                error_code=error_code,
+                error_description=error_description,
+            )
+        )
+        error = (
+            "Spotify refresh token is no longer valid. "
+            "Run `mopidy spotify auth` or configure client_id/client_secret "
+            "in the Spotify extension config."
+        )
+        raise OAuthPermanentRefreshError(error)
 
     def get_one(self, path: str, *args: Any, **kwargs: Any) -> WebResponse:
         _trace(f"Fetching page {path!r}")
