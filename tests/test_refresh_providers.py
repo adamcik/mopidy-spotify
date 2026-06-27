@@ -2,12 +2,12 @@ from http import HTTPStatus
 
 import pytest
 
-from mopidy_spotify import refresh_providers, web
+from mopidy_spotify import auth_state, refresh_providers, web
 
 
 def test_pkce_refresh_provider_keeps_existing_refresh_token_when_not_rotated():
     provider = refresh_providers.PkceRefreshProvider()
-    auth_payload = web.auth_state.PkceAuthorizedAuthPayload(
+    auth_payload = auth_state.PkceAuthorizedAuthPayload(
         refresh_token="refresh-token-1"  # noqa: S106
     )
 
@@ -30,13 +30,13 @@ def test_pkce_refresh_provider_marks_invalid_grant_as_permanent_error():
             error="invalid_grant",
             error_description="Refresh token expired",
         ),
-        web.auth_state.PkceAuthorizedAuthPayload(
+        auth_state.PkceAuthorizedAuthPayload(
             refresh_token="refresh-token-1"  # noqa: S106
         ),
         HTTPStatus.BAD_REQUEST,
     )
 
-    assert next_payload == web.auth_state.PermanentErrorAuthPayload(
+    assert next_payload == auth_state.PermanentErrorAuthPayload(
         mode="pkce",
         error_code="invalid_grant",
         error_description="Refresh token expired",
@@ -49,7 +49,7 @@ def test_pkce_refresh_provider_raises_transient_error_transient():
     with pytest.raises(web.OAuthTokenRefreshError, match="errorTransient"):
         provider.on_error(
             web.OAuthErrorResponse(error="errorTransient"),
-            web.auth_state.PkceAuthorizedAuthPayload(
+            auth_state.PkceAuthorizedAuthPayload(
                 refresh_token="refresh-token-1"  # noqa: S106
             ),
             HTTPStatus.BAD_REQUEST,
@@ -108,7 +108,7 @@ def test_bridge_refresh_provider_marks_invalid_client_as_permanent_error():
         HTTPStatus.UNAUTHORIZED,
     )
 
-    assert next_payload == web.auth_state.PermanentErrorAuthPayload(
+    assert next_payload == auth_state.PermanentErrorAuthPayload(
         mode="bridge",
         error_code="invalid_client",
         error_description="Client not known.",
