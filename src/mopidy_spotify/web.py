@@ -16,6 +16,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import requests
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from mopidy_spotify import utils
 
@@ -26,6 +27,9 @@ if TYPE_CHECKING:
     from mopidy.types import Uri
 
 logger = logging.getLogger(__name__)
+
+BRIDGE_REFRESH_URL = "https://auth.mopidy.com/spotify/token"
+SPOTIFY_REFRESH_URL = "https://accounts.spotify.com/api/token"
 
 
 def _trace(*args: Any, **kwargs: Any) -> None:
@@ -38,8 +42,52 @@ class OAuthTokenRefreshError(Exception):
         super().__init__(message)
 
 
+class OAuthPermanentRefreshError(OAuthTokenRefreshError):
+    pass
+
+
 class OAuthClientError(Exception):
     pass
+
+
+class OAuthTokenResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    access_token: str
+    token_type: str
+    expires_in: int | float | None = None
+    refresh_token: str | None = None
+    scope: str | None = None
+
+
+class OAuthErrorResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    error: str
+    error_description: str | None = None
+
+
+OAUTH_REFRESH_RESPONSE_ADAPTER = TypeAdapter(OAuthTokenResponse | OAuthErrorResponse)
+
+
+def _parse_token_refresh_response(
+    response: WebResponse,
+) -> OAuthTokenResponse | OAuthErrorResponse:
+    try:
+        parsed_response = OAUTH_REFRESH_RESPONSE_ADAPTER.validate_python(response)
+    except ValidationError as exc:
+        if "access_token" not in response and "error" not in response:
+            msg = "missing access_token"
+            raise OAuthTokenRefreshError(msg) from exc
+        msg = "invalid token response"
+        raise OAuthTokenRefreshError(msg) from exc
+    if (
+        isinstance(parsed_response, OAuthTokenResponse)
+        and not parsed_response.access_token
+    ):
+        msg = "missing access_token"
+        raise OAuthTokenRefreshError(msg)
+    return parsed_response
 
 
 class OAuthClient:
