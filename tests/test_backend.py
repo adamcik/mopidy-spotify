@@ -94,6 +94,25 @@ def test_on_start_configures_web_client(
     )
 
 
+def test_on_start_allows_pkce_without_bridge_credentials(
+    web_mock: mock.MagicMock,
+    config: dict[str, Any],
+):
+    config["spotify"]["client_id"] = None
+    config["spotify"]["client_secret"] = None
+
+    backend = get_backend(config)
+    with ThreadJoiner():
+        backend.on_start()
+
+    web_mock.SpotifyOAuthClient.assert_called_once_with(
+        client_id=None,
+        client_secret=None,
+        auth_state_path=Extension.get_auth_state_path(config),
+        proxy_config=config["proxy"],
+    )
+
+
 def test_on_start_logs_in(web_mock: mock.MagicMock, config: dict[str, Any]):
     backend = get_backend(config)
     backend.on_start()
