@@ -107,7 +107,7 @@ class FileAuthStateStore(AuthStateStore):
         """Serialize auth-state transitions that atomic replacement cannot protect."""
         try:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with FileLock(f"{self.path}.lock"):
+            with FileLock(f"{self.path}.lock", mode=0o600):
                 yield
         except OSError as exc:
             msg = f"Could not lock Spotify authorization state at {self.path}"
