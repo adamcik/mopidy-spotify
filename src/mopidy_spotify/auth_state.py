@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import requests
@@ -14,7 +13,7 @@ from pydantic import (
     field_serializer,
 )
 
-from mopidy_spotify import utils
+from mopidy_spotify._ext import secrets
 from mopidy_spotify.pkce import CLIENT_ID
 
 if TYPE_CHECKING:
@@ -71,29 +70,34 @@ class InvalidRefreshTokenError(ValueError):
     pass
 
 
-@dataclass(frozen=True)
-class FileAuthStateStore:
-    path: Path
+class AuthStateStore:
+    def __init__(self, secret_store: secrets.SecretStore) -> None:
+        self._secret_store = secret_store
 
     def load(self) -> AuthPayload | None:
-        if not self.path.exists():
+        content = self._secret_store.load()
+        if content is None:
             return None
 
         try:
-            return AUTH_PAYLOAD_ADAPTER.validate_json(
-                self.path.read_text(encoding="utf-8")
-            )
+            return AUTH_PAYLOAD_ADAPTER.validate_json(content)
         except (ValidationError, ValueError):
             pass
 
-        msg = f"Invalid Spotify auth.json: {self.path}"
+        msg = "Invalid Spotify authorization state"
         raise InvalidRefreshTokenError(msg)
 
     def save(self, payload: AuthPayload) -> None:
-        content = payload.model_dump_json().encode("utf-8")
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with utils.replace(self.path, mode=0o600) as file_handle:
-            file_handle.write(content)
+        self._secret_store.save(payload.model_dump_json())
+
+    def clear(self) -> None:
+        self._secret_store.clear()
+
+
+class FileAuthStateStore(AuthStateStore):
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(secrets.FileBackedSecretStore(path))
 
 
 def refresh_token_request(auth_state_path: Path) -> requests.Request:
