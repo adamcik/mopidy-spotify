@@ -55,6 +55,7 @@ def _is_permanent_error(
             return False
 
     if status_code in {
+        HTTPStatus.INTERNAL_SERVER_ERROR,
         HTTPStatus.TOO_MANY_REQUESTS,
         HTTPStatus.BAD_GATEWAY,
         HTTPStatus.SERVICE_UNAVAILABLE,

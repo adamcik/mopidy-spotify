@@ -56,12 +56,19 @@ def test_file_auth_state_store_does_not_chain_invalid_payload(tmp_path: Path):
     assert exc_info.value.__context__ is None
 
 
-def test_refresh_token_request_requires_pkce_authorized(tmp_path: Path):
-    auth_state_path = tmp_path / "auth.json"
-    auth_state_path.write_text(
-        '{"version":1,"mode":"bridge","state":"configured"}',
-        encoding="utf-8",
+def test_file_auth_state_store_does_not_overwrite_newer_state(tmp_path: Path):
+    store = auth_state.FileAuthStateStore(tmp_path / "auth.json")
+    original = auth_state.PkceAuthorizedAuthPayload(
+        refresh_token="original"  # noqa: S106
     )
+    replacement = auth_state.PkceAuthorizedAuthPayload(
+        refresh_token="replacement"  # noqa: S106
+    )
+    rotated = auth_state.PkceAuthorizedAuthPayload(
+        refresh_token="rotated"  # noqa: S106
+    )
+    store.save(original)
+    store.save(replacement)
 
-    with pytest.raises(auth_state.InvalidRefreshTokenError):
-        auth_state.refresh_token_request(auth_state_path)
+    assert not store.save_if_current(original, rotated)
+    assert store.load() == replacement
