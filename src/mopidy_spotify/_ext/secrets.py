@@ -61,7 +61,7 @@ class FileBackedSecretStore:
             return self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             msg = f"Could not load secret from {self.path}"
             raise SecretStoreError(msg) from exc
 
