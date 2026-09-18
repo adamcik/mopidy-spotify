@@ -94,6 +94,19 @@ def test_pkce_refresh_provider_raises_transient_error_transient():
         )
 
 
+def test_pkce_refresh_provider_treats_server_error_status_as_transient():
+    provider = refresh_providers.PkceRefreshProvider()
+
+    with pytest.raises(web.OAuthTokenRefreshError, match="invalid_grant"):
+        provider.state_after_error(
+            web.OAuthErrorResponse(error="invalid_grant"),
+            auth_state.PkceAuthorizedAuthPayload(
+                refresh_token="refresh-token-1"  # noqa: S106
+            ),
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+
 def test_bridge_refresh_provider_builds_client_credentials_request():
     provider = refresh_providers.BridgeRefreshProvider(
         client_id="client-id",

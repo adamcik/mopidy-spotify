@@ -1,8 +1,11 @@
+"""Versioned Spotify authorization state and its persistence rules."""
+
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Annotated, Literal
 
-import requests
+from filelock import FileLock
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -14,9 +17,9 @@ from pydantic import (
 )
 
 from mopidy_spotify._ext import secrets
-from mopidy_spotify.pkce import CLIENT_ID
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 AUTH_FILE_VERSION = 1
@@ -99,24 +102,33 @@ class FileAuthStateStore(AuthStateStore):
         self.path = path
         super().__init__(secrets.FileBackedSecretStore(path))
 
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Serialize auth-state transitions that atomic replacement cannot protect."""
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with FileLock(f"{self.path}.lock"):
+                yield
+        except OSError as exc:
+            msg = f"Could not lock Spotify authorization state at {self.path}"
+            raise secrets.SecretStoreError(msg) from exc
 
-def refresh_token_request(auth_state_path: Path) -> requests.Request:
-    payload = FileAuthStateStore(auth_state_path).load()
-    if payload is None:
-        msg = "missing refresh_token"
-        raise ValueError(msg)
-    if payload.state != "authorized" or payload.mode != "pkce":
-        error = (
-            "Spotify auth.json uses unsupported state for refresh_token: "
-            f"{auth_state_path} ({payload.mode}/{payload.state})"
-        )
-        raise InvalidRefreshTokenError(error)
-    return requests.Request(
-        "POST",
-        "https://accounts.spotify.com/api/token",
-        data={
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": payload.refresh_token.get_secret_value(),
-        },
-    )
+    def save(self, payload: AuthPayload) -> None:
+        with self._locked():
+            super().save(payload)
+
+    def clear(self) -> None:
+        with self._locked():
+            super().clear()
+
+    def save_if_current(
+        self,
+        expected: AuthPayload | None,
+        payload: AuthPayload,
+    ) -> bool:
+        """Save ``payload`` only if state still matches the caller's snapshot."""
+        with self._locked():
+            if super().load() != expected:
+                return False
+            super().save(payload)
+            return True
