@@ -1,125 +1,262 @@
+import json
+import uuid
 from pathlib import Path
-from urllib.parse import parse_qs
+from unittest import mock
 
 import pytest
+from pydantic import SecretStr
 
-from mopidy_spotify import auth_state, pkce
-
-
-def test_file_auth_state_store_returns_none_for_missing_file(tmp_path: Path):
-    assert auth_state.FileAuthStateStore(tmp_path / "auth.json").load() is None
+from mopidy_spotify import auth_state
+from mopidy_spotify._ext import secrets
 
 
-def test_file_auth_state_store_round_trips_pkce_authorized(tmp_path: Path):
-    store = auth_state.FileAuthStateStore(tmp_path / "auth.json")
-    token_id = 1
-    refresh_token = f"refresh-token-{token_id}"
+class MemoryKeyring:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], str] = {}
 
-    store.save(auth_state.PkceAuthorizedAuthPayload(refresh_token=refresh_token))
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.values.get((service, username))
 
-    assert store.load() == auth_state.PkceAuthorizedAuthPayload(
-        refresh_token=refresh_token
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.values[service, username] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        del self.values[service, username]
+
+
+def test_auth_state_store_returns_none_for_missing_file(tmp_path: Path):
+    assert auth_state.AuthStateStore(tmp_path / "auth.json").load() is None
+
+
+def test_auth_state_store_round_trips_inline_authorization(tmp_path: Path):
+    path = tmp_path / "auth.json"
+    store = auth_state.AuthStateStore(path)
+
+    store.authorize(SecretStr("refresh-token"))
+
+    snapshot = store.load()
+    assert snapshot is not None
+    assert snapshot.state == auth_state.PkceAuthorizedAuthState(
+        refresh_token=SecretStr("refresh-token")
+    )
+    assert json.loads(path.read_text()) == {
+        "version": 1,
+        "mode": "pkce",
+        "state": "authorized",
+        "refresh_token": {"storage": "inline", "value": "refresh-token"},
+    }
+
+
+def test_auth_state_store_round_trips_keyring_authorization(tmp_path: Path):
+    path = tmp_path / "auth.json"
+    keyring = MemoryKeyring()
+    store = auth_state.AuthStateStore(
+        path,
+        keyring_backend=keyring,
+        generate_keyring_username=lambda: "token-id",
     )
 
+    store.authorize(SecretStr("refresh-token"), auth_state.SecretStorage.KEYRING)
 
-def test_pkce_refresh_token_is_redacted_but_serialized_for_storage():
-    token = "refresh-token-secret"  # noqa: S105
-    payload = auth_state.PkceAuthorizedAuthPayload(refresh_token=token)
-
-    assert token not in repr(payload)
-    assert token in payload.model_dump_json()
-
-
-def test_file_auth_state_store_round_trips_cleared_bridge(tmp_path: Path):
-    store = auth_state.FileAuthStateStore(tmp_path / "auth.json")
-
-    store.save(auth_state.ClearedAuthPayload(mode="bridge"))
-
-    assert store.load() == auth_state.ClearedAuthPayload(mode="bridge")
-
-
-def test_file_auth_state_store_rejects_invalid_json(tmp_path: Path):
-    auth_state_path = tmp_path / "auth.json"
-    auth_state_path.write_text("not-json", encoding="utf-8")
-
-    with pytest.raises(auth_state.InvalidRefreshTokenError):
-        auth_state.FileAuthStateStore(auth_state_path).load()
+    snapshot = store.load()
+    assert snapshot is not None
+    assert snapshot.state == auth_state.PkceAuthorizedAuthState(
+        refresh_token=SecretStr("refresh-token")
+    )
+    assert json.loads(path.read_text()) == {
+        "version": 1,
+        "mode": "pkce",
+        "state": "authorized",
+        "refresh_token": {
+            "storage": "keyring",
+            "service": "mopidy-spotify",
+            "username": "token-id",
+        },
+    }
+    assert keyring.values == {("mopidy-spotify", "token-id"): "refresh-token"}
 
 
-def test_file_auth_state_store_does_not_chain_invalid_payload(tmp_path: Path):
-    auth_state_path = tmp_path / "auth.json"
-    auth_state_path.write_text(
-        '{"version":1,"mode":"pkce","state":"authorized",'
-        '"refresh_token":"must-not-leak","extra":true}',
-        encoding="utf-8",
+def test_auth_state_store_rejects_greenfield_raw_token_shape(tmp_path: Path):
+    path = tmp_path / "auth.json"
+    path.write_text(
+        '{"version":1,"mode":"pkce","state":"authorized","refresh_token":"old-shape"}'
     )
 
-    with pytest.raises(auth_state.InvalidRefreshTokenError) as exc_info:
-        auth_state.FileAuthStateStore(auth_state_path).load()
+    with pytest.raises(auth_state.InvalidAuthStateError):
+        auth_state.AuthStateStore(path).load()
+
+
+def test_auth_state_store_does_not_chain_invalid_payload(tmp_path: Path):
+    path = tmp_path / "auth.json"
+    path.write_text('{"refresh_token":{"storage":"inline","value":"secret"}}')
+
+    with pytest.raises(auth_state.InvalidAuthStateError) as exc_info:
+        auth_state.AuthStateStore(path).load()
 
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
 
 
-@pytest.mark.parametrize(
-    ("name", "payload"),
-    [
-        (
-            "configured-bridge",
-            auth_state.BridgeConfiguredAuthPayload(),
-        ),
-        (
-            "cleared-pkce",
-            auth_state.ClearedAuthPayload(mode="pkce"),
-        ),
-        (
-            "cleared-bridge",
-            auth_state.ClearedAuthPayload(mode="bridge"),
-        ),
-        (
-            "error-pkce",
-            auth_state.PermanentErrorAuthPayload(
-                mode="pkce", error_code="invalid_grant"
-            ),
-        ),
-        (
-            "error-bridge",
-            auth_state.PermanentErrorAuthPayload(
-                mode="bridge", error_code="invalid_grant"
-            ),
-        ),
-    ],
-)
-def test_refresh_token_request_requires_pkce_authorized(
-    tmp_path: Path, name: str, payload: auth_state.AuthPayload
-):
-    auth_state_path = tmp_path / "auth.json"
-    auth_state.FileAuthStateStore(auth_state_path).save(payload)
-
-    with pytest.raises(auth_state.InvalidRefreshTokenError, match="unsupported state"):
-        auth_state.refresh_token_request(auth_state_path)
-
-
-def test_refresh_token_request_rejects_missing_auth_file(tmp_path: Path):
-    with pytest.raises(ValueError, match="missing refresh_token"):
-        auth_state.refresh_token_request(tmp_path / "auth.json")
-
-
-def test_refresh_token_request_encodes_persisted_token(tmp_path: Path):
-    auth_state_path = tmp_path / "auth.json"
-    token = "refresh+/=&?"  # noqa: S105 - Synthetic value exercises form encoding.
-    auth_state.FileAuthStateStore(auth_state_path).save(
-        auth_state.PkceAuthorizedAuthPayload(refresh_token=token)
+def test_missing_keyring_entry_is_distinct_from_invalid_manifest(tmp_path: Path):
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "pkce",
+                "state": "authorized",
+                "refresh_token": {
+                    "storage": "keyring",
+                    "service": "mopidy-spotify",
+                    "username": "missing",
+                },
+            }
+        )
     )
 
-    request = auth_state.refresh_token_request(auth_state_path).prepare()
+    with pytest.raises(secrets.SecretNotFoundError):
+        auth_state.AuthStateStore(path, keyring_backend=MemoryKeyring()).load()
 
-    assert request.method == "POST"
-    assert request.url == "https://accounts.spotify.com/api/token"
-    assert request.headers["Content-Type"] == "application/x-www-form-urlencoded"
-    assert isinstance(request.body, str)
-    assert parse_qs(request.body) == {
-        "client_id": [pkce.CLIENT_ID],
-        "grant_type": ["refresh_token"],
-        "refresh_token": [token],
+
+def test_missing_inline_value_is_distinct_from_invalid_manifest(tmp_path: Path):
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "pkce",
+                "state": "authorized",
+                "refresh_token": {"storage": "inline", "value": ""},
+            }
+        )
+    )
+
+    with pytest.raises(secrets.SecretNotFoundError, match="Inline"):
+        auth_state.AuthStateStore(path).load()
+
+
+def test_keyring_descriptor_does_not_fall_back_to_inline_storage(tmp_path: Path):
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "pkce",
+                "state": "authorized",
+                "refresh_token": {
+                    "storage": "keyring",
+                    "service": "mopidy-spotify",
+                    "username": "missing",
+                },
+            }
+        )
+    )
+
+    with (
+        mock.patch.object(
+            secrets.importlib,
+            "import_module",
+            side_effect=ImportError,
+        ),
+        pytest.raises(secrets.SecretBackendUnavailableError),
+    ):
+        auth_state.AuthStateStore(path).load()
+
+
+def test_rotated_keyring_token_uses_fresh_address_and_clears_old(tmp_path: Path):
+    usernames = iter(["first", "second"])
+    keyring = MemoryKeyring()
+    store = auth_state.AuthStateStore(
+        tmp_path / "auth.json",
+        keyring_backend=keyring,
+        generate_keyring_username=lambda: next(usernames),
+    )
+    store.authorize(SecretStr("original"), auth_state.SecretStorage.KEYRING)
+    snapshot = store.load()
+    assert snapshot is not None
+
+    assert store.save_if_current(
+        snapshot,
+        auth_state.PkceAuthorizedAuthState(refresh_token=SecretStr("rotated")),
+    )
+
+    assert keyring.values == {("mopidy-spotify", "second"): "rotated"}
+
+
+def test_stale_keyring_rotation_does_not_create_candidate(tmp_path: Path):
+    usernames = iter(["first", "replacement", "stale-candidate"])
+    keyring = MemoryKeyring()
+    store = auth_state.AuthStateStore(
+        tmp_path / "auth.json",
+        keyring_backend=keyring,
+        generate_keyring_username=lambda: next(usernames),
+    )
+    store.authorize(SecretStr("original"), auth_state.SecretStorage.KEYRING)
+    stale = store.load()
+    assert stale is not None
+    store.authorize(SecretStr("replacement"), auth_state.SecretStorage.KEYRING)
+
+    assert not store.save_if_current(
+        stale,
+        auth_state.PkceAuthorizedAuthState(refresh_token=SecretStr("rotated")),
+    )
+    assert "stale-candidate" not in {username for _, username in keyring.values}
+
+
+def test_failed_manifest_update_removes_keyring_candidate(tmp_path: Path):
+    usernames = iter(["first", "candidate"])
+    keyring = MemoryKeyring()
+    store = auth_state.AuthStateStore(
+        tmp_path / "auth.json",
+        keyring_backend=keyring,
+        generate_keyring_username=lambda: next(usernames),
+    )
+    store.authorize(SecretStr("original"), auth_state.SecretStorage.KEYRING)
+    snapshot = store.load()
+    assert snapshot is not None
+
+    with (
+        mock.patch.object(auth_state.atomic, "write", side_effect=OSError),
+        pytest.raises(auth_state.AuthStateStoreError),
+    ):
+        store.save_if_current(
+            snapshot,
+            auth_state.PkceAuthorizedAuthState(refresh_token=SecretStr("rotated")),
+        )
+
+    assert keyring.values == {("mopidy-spotify", "first"): "original"}
+
+
+def test_clear_removes_keyring_token_and_persists_cleared_state(tmp_path: Path):
+    keyring = MemoryKeyring()
+    path = tmp_path / "auth.json"
+    store = auth_state.AuthStateStore(
+        path,
+        keyring_backend=keyring,
+        generate_keyring_username=lambda: "token-id",
+    )
+    store.authorize(SecretStr("refresh-token"), auth_state.SecretStorage.KEYRING)
+
+    store.clear()
+
+    assert keyring.values == {}
+    assert json.loads(path.read_text()) == {
+        "version": 1,
+        "mode": "pkce",
+        "state": "cleared",
     }
+
+
+def test_generate_uuid7_returns_version_seven_uuid():
+    generated = uuid.UUID(auth_state.generate_uuid7())
+
+    assert generated.version == 7
+    assert generated.variant == uuid.RFC_4122
+
+
+def test_generate_uuid7_is_monotonic_within_one_millisecond():
+    with mock.patch.object(auth_state.time, "time", return_value=1_000.0):
+        first = uuid.UUID(auth_state.generate_uuid7())
+        second = uuid.UUID(auth_state.generate_uuid7())
+
+    assert first.int < second.int

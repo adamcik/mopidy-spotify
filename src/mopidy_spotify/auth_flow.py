@@ -15,6 +15,7 @@ import requests
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 from mopidy_spotify import auth_state, pkce, utils
+from mopidy_spotify._ext import secrets
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ class AuthChallenge:
 
 @dataclass(frozen=True)
 class AuthSuccess:
-    refresh_token: str
+    """Signal that authorization completed without exposing its secret."""
 
 
 class AuthFlowError(Exception):
@@ -146,6 +147,7 @@ class AuthFlow:
         config: Config,
         auth_state_path: Path,
         *,
+        storage: auth_state.SecretStorage = auth_state.SecretStorage.INLINE,
         # Inject collaborators so tests can replace side effects cleanly.
         generate_pkce_verifier: PkceVerifierGenerator = pkce.generate_pkce_verifier,
         generate_state: StateGenerator = pkce.generate_state,
@@ -160,7 +162,8 @@ class AuthFlow:
         ),
     ) -> None:
         self._config = config
-        self._auth_state_store = auth_state.FileAuthStateStore(auth_state_path)
+        self._auth_state_store = auth_state.AuthStateStore(auth_state_path)
+        self._storage = storage
         self._generate_pkce_verifier = generate_pkce_verifier
         self._generate_state = generate_state
         self._generate_authorization_url = generate_authorization_url
@@ -203,7 +206,8 @@ class AuthFlow:
         if secret is None:
             msg = "missing refresh_token."
             raise AuthExchangeError(msg)
-        self._auth_state_store.save(
-            auth_state.PkceAuthorizedAuthPayload(refresh_token=secret)
-        )
-        return AuthSuccess(secret.get_secret_value())
+        try:
+            self._auth_state_store.authorize(secret, self._storage)
+        except (auth_state.AuthStateStoreError, secrets.SecretStoreError) as exc:
+            raise AuthExchangeError(str(exc)) from exc
+        return AuthSuccess()

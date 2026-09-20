@@ -46,10 +46,13 @@ def run_auth_command(
 
 
 @app.command(help="Store Spotify PKCE authorization.")
-def auth() -> int:
+def auth(
+    *,
+    storage: auth_state.SecretStorage = auth_state.SecretStorage.INLINE,
+) -> int:
     config = Config.get_global()
     auth_state_path = Extension.get_auth_state_path(config)
-    flow = auth_flow.AuthFlow(config, auth_state_path)
+    flow = auth_flow.AuthFlow(config, auth_state_path, storage=storage)
     return run_auth_command(flow)
 
 
@@ -78,14 +81,7 @@ def logout() -> None:
 
     auth_state_cleared = True
     try:
-        try:
-            payload = auth_state.FileAuthStateStore(auth_state_path).load()
-        except auth_state.InvalidRefreshTokenError:
-            payload = None
-        mode = payload.mode if payload is not None else "bridge"
-        auth_state.FileAuthStateStore(auth_state_path).save(
-            auth_state.ClearedAuthPayload(mode=mode)
-        )
+        auth_state.AuthStateStore(auth_state_path).clear()
         logger.debug(f"Cleared file {auth_state_path}")
     except Exception as error:  # noqa: BLE001
         auth_state_cleared = False
