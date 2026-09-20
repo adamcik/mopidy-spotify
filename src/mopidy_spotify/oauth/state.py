@@ -1,26 +1,52 @@
+"""Pure models for versioned Spotify Web authorization state."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Literal
+from enum import StrEnum
+from typing import Annotated, Literal
 
-import requests
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     SecretStr,
     TypeAdapter,
-    ValidationError,
     field_serializer,
 )
 
-from mopidy_spotify import utils
-from mopidy_spotify.oauth.pkce import CLIENT_ID
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
 AUTH_FILE_VERSION = 1
+KEYRING_SERVICE = "mopidy-spotify"
+
+
+class SecretStorage(StrEnum):
+    INLINE = "inline"
+    KEYRING = "keyring"
+
+
+class InlineRefreshToken(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    storage: Literal["inline"] = "inline"
+    value: SecretStr
+
+    @field_serializer("value", when_used="json")
+    def serialize_value(self, value: SecretStr) -> str:
+        return value.get_secret_value()
+
+
+class KeyringRefreshToken(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    storage: Literal["keyring"] = "keyring"
+    service: Literal["mopidy-spotify"] = KEYRING_SERVICE
+    username: str
+
+
+type RefreshToken = Annotated[
+    InlineRefreshToken | KeyringRefreshToken,
+    Field(discriminator="storage"),
+]
 
 
 class AuthPayloadBase(BaseModel):
@@ -32,12 +58,7 @@ class AuthPayloadBase(BaseModel):
 class PkceAuthorizedAuthPayload(AuthPayloadBase):
     mode: Literal["pkce"] = "pkce"
     state: Literal["authorized"] = "authorized"
-    refresh_token: SecretStr
-
-    @field_serializer("refresh_token", when_used="json")
-    def serialize_refresh_token(self, value: SecretStr) -> str:
-        # Persist only at the storage sink; repr and diagnostics stay redacted.
-        return value.get_secret_value()
+    refresh_token: RefreshToken
 
 
 class BridgeConfiguredAuthPayload(AuthPayloadBase):
@@ -67,52 +88,37 @@ type AuthPayload = Annotated[
 AUTH_PAYLOAD_ADAPTER = TypeAdapter(AuthPayload)
 
 
-class InvalidRefreshTokenError(ValueError):
-    pass
+class PkceAuthorizedAuthState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    refresh_token: SecretStr
+    mode: Literal["pkce"] = "pkce"
+    state: Literal["authorized"] = "authorized"
 
 
 @dataclass(frozen=True)
-class FileAuthStateStore:
-    path: Path
-
-    def load(self) -> AuthPayload | None:
-        if not self.path.exists():
-            return None
-
-        try:
-            return AUTH_PAYLOAD_ADAPTER.validate_json(
-                self.path.read_text(encoding="utf-8")
-            )
-        except (ValidationError, ValueError):
-            pass
-
-        msg = f"Invalid Spotify auth.json: {self.path}"
-        raise InvalidRefreshTokenError(msg)
-
-    def save(self, payload: AuthPayload) -> None:
-        content = payload.model_dump_json().encode("utf-8")
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with utils.replace(self.path, mode=0o600) as file_handle:
-            file_handle.write(content)
+class BridgeConfiguredAuthState:
+    mode: Literal["bridge"] = "bridge"
+    state: Literal["configured"] = "configured"
 
 
-def refresh_token_request(auth_state_path: Path) -> requests.Request:
-    payload = FileAuthStateStore(auth_state_path).load()
-    if payload is None:
-        msg = "missing refresh_token"
-        raise ValueError(msg)
-    if payload.state != "authorized" or payload.mode != "pkce":
-        error = (
-            "Spotify auth.json uses unsupported state for refresh_token: "
-            f"{auth_state_path} ({payload.mode}/{payload.state})"
-        )
-        raise InvalidRefreshTokenError(error)
-    return requests.Request(
-        "POST",
-        "https://accounts.spotify.com/api/token",
-        data={
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": payload.refresh_token.get_secret_value(),
-        },
-    )
+@dataclass(frozen=True)
+class ClearedAuthState:
+    mode: Literal["pkce", "bridge"]
+    state: Literal["cleared"] = "cleared"
+
+
+@dataclass(frozen=True)
+class PermanentErrorAuthState:
+    mode: Literal["pkce", "bridge"]
+    error_code: str
+    error_description: str | None = None
+    state: Literal["permanent_error"] = "permanent_error"
+
+
+type AuthState = (
+    PkceAuthorizedAuthState
+    | BridgeConfiguredAuthState
+    | ClearedAuthState
+    | PermanentErrorAuthState
+)
